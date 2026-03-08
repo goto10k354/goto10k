@@ -14,22 +14,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ======= Конфігурація =======
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("Environment variable BOT_TOKEN is required")
-
-try:
-    ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-except ValueError:
-    ADMIN_ID = 0
-
-try:
-    CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
-except ValueError:
-    CHANNEL_ID = 0
-
-SERVER_URL = os.getenv("SERVER_URL", "http://localhost:5000")
-WEBHOOK_URL = f"{SERVER_URL}/webhook"
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+SERVER_URL = "https://goto10k-l0dh.onrender.com"
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 PORT = int(os.getenv("PORT", "5000"))
 
 app = Flask(__name__)
@@ -51,7 +39,6 @@ idle_stop_event = threading.Event()
 PERSIST_FILE = Path("message_count.json")
 lock = threading.Lock()
 
-
 def load_count():
     try:
         if PERSIST_FILE.exists():
@@ -61,16 +48,13 @@ def load_count():
         logger.exception("Failed to load count")
     return 0
 
-
 def save_count(value):
     try:
         PERSIST_FILE.write_text(json.dumps({"count": int(value)}), encoding="utf-8")
     except Exception:
         logger.exception("Failed to save count")
 
-
 message_count = load_count()
-
 
 def increment_count():
     global message_count
@@ -78,7 +62,6 @@ def increment_count():
         message_count += 1
         save_count(message_count)
         return message_count
-
 
 # ======= Текстові константи =======
 WELCOME_TEXT = (
@@ -119,7 +102,6 @@ def simulate_user_activity():
     except Exception as e:
         logger.error(f"Error in simulate_user_activity: {e}")
 
-
 def idle_mode_worker():
     logger.info("[IDLE MODE] Холостий хід активований")
     while not idle_stop_event.is_set():
@@ -132,7 +114,6 @@ def idle_mode_worker():
             logger.error(f"[IDLE MODE] Помилка: {e}")
             time.sleep(5)
 
-
 def start_idle_mode():
     global idle_thread
     try:
@@ -143,7 +124,6 @@ def start_idle_mode():
             logger.info("[IDLE MODE] Потік запущен")
     except Exception as e:
         logger.error(f"Error starting idle mode: {e}")
-
 
 def stop_idle_mode():
     global idle_thread
@@ -156,10 +136,8 @@ def stop_idle_mode():
     except Exception as e:
         logger.error(f"Error stopping idle mode: {e}")
 
-
 # ======= Telegram API функції =======
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
 
 def send_message(chat_id, text, parse_mode=None, reply_markup=None):
     url = f"{API_BASE}/sendMessage"
@@ -176,10 +154,9 @@ def send_message(chat_id, text, parse_mode=None, reply_markup=None):
         logger.exception(f"Failed to send message to {chat_id}")
         return None
 
-
 def register_webhook():
     url = f"{API_BASE}/setWebhook"
-    webhook_endpoint = f"{WEBHOOK_URL}/{BOT_TOKEN}"
+    webhook_endpoint = f"{SERVER_URL}/webhook/{BOT_TOKEN}"
     payload = {
         "url": webhook_endpoint,
         "allowed_updates": ["message"]
@@ -198,7 +175,6 @@ def register_webhook():
         logger.exception("❌ Помилка реєстрації вебхука")
         return False
 
-
 def delete_webhook():
     url = f"{API_BASE}/deleteWebhook"
     try:
@@ -207,7 +183,6 @@ def delete_webhook():
         logger.info("✅ Вебхук видалений")
     except Exception:
         logger.exception("❌ Помилка видалення вебхука")
-
 
 # ======= Обработка команд в отдельном потоке =======
 def handle_command(command, chat_id, user_id):
@@ -227,7 +202,6 @@ def handle_command(command, chat_id, user_id):
 
     except Exception as e:
         logger.error(f"[THREAD ERROR] {e}", exc_info=True)
-
 
 def handle_plus_command(chat_id, user_id, text):
     try:
@@ -269,9 +243,8 @@ def handle_plus_command(chat_id, user_id, text):
     except Exception as e:
         logger.error(f"[THREAD ERROR] {e}", exc_info=True)
 
-
 # ======= Webhook handler =======
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+@app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
 def webhook():
     logger.info("[WEBHOOK] POST запит отримано")
 
@@ -291,14 +264,14 @@ def webhook():
         user_id = from_user.get("id")
         text = msg.get("text", "") or ""
 
-        logger.info(f"[WEBHOOK] chat_id={chat_id}, user_id={user_id}, text='{text}'")
+        logger.info(f"[WEBHOOK] chat_id={{chat_id}}, user_id={{user_id}}, text='{{text}}'")
 
         # Пошук команди
         command = None
         for possible in ("/start", "/stats"):
             if text.startswith(possible):
                 command = possible
-                logger.info(f"[WEBHOOK] Команда: {command}")
+                logger.info(f"[WEBHOOK] Команда: {{command}}")
                 break
 
         if command:
@@ -306,7 +279,7 @@ def webhook():
             return "ok", 200
 
         # Обработка +число
-        if text.startswith("+"):
+        if text.startswith("+"): 
             threading.Thread(target=handle_plus_command, args=(chat_id, user_id, text), daemon=True).start()
             return "ok", 200
 
@@ -316,16 +289,13 @@ def webhook():
         logger.error(f"[WEBHOOK ERROR] {e}", exc_info=True)
         return "error", 500
 
-
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True}), 200
 
-
 @app.route("/", methods=["GET"])
 def index():
     return "✅ Бот запущен", 200
-
 
 if __name__ == "__main__":
     try:
