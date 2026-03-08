@@ -3,9 +3,12 @@ import time
 import json
 import logging
 import threading
+import hmac
+import hashlib
 from pathlib import Path
 from datetime import datetime
 import random
+from functools import wraps
 
 import requests
 from flask import Flask, request, jsonify
@@ -27,9 +30,26 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ======= Стан чатів =======
-active_requests = {}
-admin_targets = {}
+# ======= Rate limiting =======
+request_counts = {}
+RATE_LIMIT_WINDOW = 60
+RATE_LIMIT_MAX = 10
+
+def rate_limit_check(user_id):
+    """Перевірка rate limiting"""
+    current_time = time.time()
+    key = f"user_{user_id}_{int(current_time // RATE_LIMIT_WINDOW)}"
+    
+    request_counts[key] = request_counts.get(key, 0) + 1
+    
+    if request_counts[key] > RATE_LIMIT_MAX:
+        return False
+    
+    # Очистка старих записів
+    if len(request_counts) > 1000:
+        request_counts.clear()
+    
+    return True
 
 # ======= Idle mode =======
 idle_mode_enabled = True
@@ -90,6 +110,7 @@ DONE_TEXT = (
 
 ERROR_FORMAT_TEXT = "❌ Неверний формат. Використовуйте +<число>, наприклад +20"
 ERROR_ADMIN_TEXT = "❌ Ви не адміністратор"
+ERROR_RATE_LIMIT = "❌ Забагато запитів. Спробуйте пізніше"
 
 # ======= Idle mode функції =======
 def simulate_user_activity():
@@ -104,6 +125,7 @@ def simulate_user_activity():
         logger.info(f"[IDLE MODE] {timestamp} → {activity}")
     except Exception as e:
         logger.error(f"Error in simulate_user_activity: {e}")
+
 
 def idle_mode_worker():
     logger.info("[IDLE MODE] Холостий хід активований")
@@ -159,9 +181,10 @@ def send_message(chat_id, text, parse_mode=None, reply_markup=None):
         logger.exception(f"Failed to send message to {chat_id}: {e}")
         return None
 
+
 def register_webhook():
     url = f"{API_BASE}/setWebhook"
-    webhook_endpoint = f"{SERVER_URL}/webhook/{BOT_TOKEN}"
+    webhook_endpoint = f"{SERVER_URL}/webhook"
     payload = {
         "url": webhook_endpoint,
         "allowed_updates": ["message"]
@@ -179,6 +202,7 @@ def register_webhook():
     except Exception as e:
         logger.exception(f"❌ Помилка реєстрації вебхука: {e}")
         return False
+
 
 def delete_webhook():
     url = f"{API_BASE}/deleteWebhook"
@@ -225,6 +249,9 @@ def handle_plus_command(chat_id, user_id, text):
             count = int(text.lstrip("+").strip())
             if count <= 0:
                 raise ValueError("non-positive")
+            if count > 1000:
+                send_message(chat_id, "❌ Максимум 1000 повідомлень за раз", parse_mode="HTML")
+                return
         except Exception:
             send_message(chat_id, ERROR_FORMAT_TEXT, parse_mode="HTML")
             return
@@ -252,7 +279,7 @@ def handle_plus_command(chat_id, user_id, text):
         logger.error(f"[THREAD ERROR] {e}", exc_info=True)
 
 # ======= Webhook handler =======
-@app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
+@app.route("/webhook", methods=["POST"])
 def webhook():
     logger.info("[WEBHOOK] POST запит отримано")
 
@@ -271,6 +298,15 @@ def webhook():
         from_user = msg.get("from", {}) or {}
         user_id = from_user.get("id")
         text = msg.get("text", "") or ""
+
+        if not user_id:
+            logger.warning("[WEBHOOK] Немає user_id")
+            return "ok", 200
+
+        # Rate limiting
+        if not rate_limit_check(user_id):
+            send_message(chat_id, ERROR_RATE_LIMIT, parse_mode="HTML")
+            return "ok", 200
 
         logger.info(f"[WEBHOOK] chat_id={chat_id}, user_id={user_id}, text='{text}'")
 
@@ -321,7 +357,7 @@ if __name__ == "__main__":
         
         # Запускаем Flask приложение
         logger.info(f"Запуск бота на 0.0.0.0:{PORT}")
-        app.run("0.0.0.0", port=PORT, threaded=True)
+        app.run("0.0.0.0", port=PORT, threaded=True, debug=False)
     except Exception as e:
         logger.error(f"Error running app: {e}")
     finally:
