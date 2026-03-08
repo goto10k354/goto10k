@@ -266,7 +266,7 @@ def handle_plus_command(chat_id, user_id, text):
                 send_message(CHANNEL_ID, f"+1 ({i+1}/{count})")
                 increment_count()
                 sent += 1
-                time.sleep(0.05)
+                time.sleep(0.15)
             except Exception as e:
                 logger.exception(f"Error sending message to channel: {e}")
                 send_message(chat_id, f"Ошибка при отправке: {e}", parse_mode="HTML")
