@@ -15,7 +15,10 @@ load_dotenv()
 
 # ======= Конфігурація =======
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-SERVER_URL = "https://goto10k-l0dh.onrender.com"
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN не установлен в переменных окружения")
+
+SERVER_URL = os.getenv('SERVER_URL', 'https://goto10k-l0dh.onrender.com').rstrip('/')
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 PORT = int(os.getenv("PORT", "5000"))
@@ -44,15 +47,15 @@ def load_count():
         if PERSIST_FILE.exists():
             data = json.loads(PERSIST_FILE.read_text(encoding="utf-8"))
             return int(data.get("count", 0))
-    except Exception:
-        logger.exception("Failed to load count")
+    except Exception as e:
+        logger.exception(f"Failed to load count: {e}")
     return 0
 
 def save_count(value):
     try:
         PERSIST_FILE.write_text(json.dumps({"count": int(value)}), encoding="utf-8")
-    except Exception:
-        logger.exception("Failed to save count")
+    except Exception as e:
+        logger.exception(f"Failed to save count: {e}")
 
 message_count = load_count()
 
@@ -114,6 +117,7 @@ def idle_mode_worker():
             logger.error(f"[IDLE MODE] Помилка: {e}")
             time.sleep(5)
 
+
 def start_idle_mode():
     global idle_thread
     try:
@@ -124,6 +128,7 @@ def start_idle_mode():
             logger.info("[IDLE MODE] Потік запущен")
     except Exception as e:
         logger.error(f"Error starting idle mode: {e}")
+
 
 def stop_idle_mode():
     global idle_thread
@@ -150,8 +155,8 @@ def send_message(chat_id, text, parse_mode=None, reply_markup=None):
         resp = requests.post(url, json=payload, timeout=10)
         resp.raise_for_status()
         return resp.json()
-    except Exception:
-        logger.exception(f"Failed to send message to {chat_id}")
+    except Exception as e:
+        logger.exception(f"Failed to send message to {chat_id}: {e}")
         return None
 
 def register_webhook():
@@ -171,8 +176,8 @@ def register_webhook():
         else:
             logger.error(f"❌ Помилка: {result.get('description')}")
             return False
-    except Exception:
-        logger.exception("❌ Помилка реєстрації вебхука")
+    except Exception as e:
+        logger.exception(f"❌ Помилка реєстрації вебхука: {e}")
         return False
 
 def delete_webhook():
@@ -181,8 +186,10 @@ def delete_webhook():
         resp = requests.post(url, timeout=10)
         resp.raise_for_status()
         logger.info("✅ Вебхук видалений")
-    except Exception:
-        logger.exception("❌ Помилка видалення вебхука")
+        return True
+    except Exception as e:
+        logger.exception(f"❌ Помилка видалення вебхука: {e}")
+        return False
 
 # ======= Обработка команд в отдельном потоке =======
 def handle_command(command, chat_id, user_id):
@@ -202,6 +209,7 @@ def handle_command(command, chat_id, user_id):
 
     except Exception as e:
         logger.error(f"[THREAD ERROR] {e}", exc_info=True)
+
 
 def handle_plus_command(chat_id, user_id, text):
     try:
@@ -233,7 +241,7 @@ def handle_plus_command(chat_id, user_id, text):
                 sent += 1
                 time.sleep(0.05)
             except Exception as e:
-                logger.exception(f"Error sending message to channel")
+                logger.exception(f"Error sending message to channel: {e}")
                 send_message(chat_id, f"Ошибка при отправке: {e}", parse_mode="HTML")
                 break
 
@@ -264,14 +272,14 @@ def webhook():
         user_id = from_user.get("id")
         text = msg.get("text", "") or ""
 
-        logger.info(f"[WEBHOOK] chat_id={{chat_id}}, user_id={{user_id}}, text='{{text}}'")
+        logger.info(f"[WEBHOOK] chat_id={chat_id}, user_id={user_id}, text='{text}'")
 
         # Пошук команди
         command = None
         for possible in ("/start", "/stats"):
             if text.startswith(possible):
                 command = possible
-                logger.info(f"[WEBHOOK] Команда: {{command}}")
+                logger.info(f"[WEBHOOK] Команда: {command}")
                 break
 
         if command:
@@ -299,8 +307,20 @@ def index():
 
 if __name__ == "__main__":
     try:
+        # Удаляем старый webhook перед регистрацией нового
+        logger.info("Удаление старого webhook...")
+        delete_webhook()
+        time.sleep(1)
+        
+        # Запускаем idle режим
         start_idle_mode()
+        
+        # Регистрируем новый webhook
+        logger.info("Регистрация нового webhook...")
         register_webhook()
+        
+        # Запускаем Flask приложение
+        logger.info(f"Запуск бота на 0.0.0.0:{PORT}")
         app.run("0.0.0.0", port=PORT, threaded=True)
     except Exception as e:
         logger.error(f"Error running app: {e}")
