@@ -270,20 +270,53 @@ def stop_idle_mode():
 # ======= Telegram API функції =======
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-def send_message(chat_id, text, parse_mode=None, reply_markup=None):
+def send_message_safe(chat_id, text, parse_mode=None, reply_markup=None, max_retries=3):
+    """МОДИФІКОВАНО: Безпечна відправка з повторними спробами"""
     url = f"{API_BASE}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
     if parse_mode:
         payload["parse_mode"] = parse_mode
     if reply_markup is not None:
         payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
-    try:
-        resp = requests.post(url, json=payload, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        logger.exception(f"Failed to send message to {chat_id}: {e}")
-        return None
+    
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(url, json=payload, timeout=10)
+            resp.raise_for_status()
+            result = resp.json()
+            
+            if result.get("ok"):
+                logger.info(f"[SEND] Успішно відправлено до {chat_id} (спроба {attempt + 1})")
+                return result
+            else:
+                error_msg = result.get("description", "Unknown error")
+                logger.warning(f"[SEND] Telegram API помилка: {error_msg}")
+                if attempt < max_retries - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                continue
+        except requests.exceptions.Timeout:
+            logger.warning(f"[SEND] Timeout при спробі {attempt + 1}/{max_retries}")
+            if attempt < max_retries - 1:
+                time.sleep(1 * (attempt + 1))
+            continue
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"[SEND] Помилка з'єднання при спробі {attempt + 1}/{max_retries}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(1 * (attempt + 1))
+            continue
+        except Exception as e:
+            logger.error(f"[SEND] Непередбачена помилка при спробі {attempt + 1}/{max_retries}: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+            continue
+    
+    logger.error(f"[SEND] Не вдалось відправити повідомлення до {chat_id} після {max_retries} спроб")
+    return None
+
+
+def send_message(chat_id, text, parse_mode=None, reply_markup=None):
+    """Обгортка для зворотної сумісності"""
+    return send_message_safe(chat_id, text, parse_mode, reply_markup)
 
 
 def register_webhook():
@@ -392,23 +425,41 @@ def handle_plus_command(chat_id, user_id, text):
         logger.info(f"[BATCH {batch_id}] Початок відправлення {count} повідомлень")
 
         sent = 0
-        sequence_start = global_sequence        
+        failed = 0
+        sequence_start = global_sequence
         
         for i in range(count):
             try:
+                # МОДИФІКОВАНО: Отримуємо послідовність перед відправкою
                 seq_num = get_next_sequence()
-                # Відправляємо глобальний номер послідовності, а не локальний
-                send_message(CHANNEL_ID, f"+1 (Послідовність: {seq_num})")
-                increment_count()
-                sent += 1
-                time.sleep(0.15)
+                local_num = i + 1
+                
+                # МОДИФІКОВАНО: Комбінований номер (локальний + глобальний)
+                msg_text = f"+{local_num} (Seq: {seq_num})"
+                
+                # МОДИФІКОВАНО: Відправляємо з перевіркою успішності
+                result = send_message_safe(CHANNEL_ID, msg_text, max_retries=3)
+                
+                if result and result.get("ok"):
+                    # МОДИФІКОВАНО: Тільки збільшуємо счетчик при успішній відправці
+                    increment_count()
+                    sent += 1
+                    logger.info(f"[BATCH {batch_id}] Повідомлення {local_num}/{count} успішно (Seq: {seq_num})")
+                else:
+                    # Якщо не вдалось, пропускаємо і рахуємо як невдачу
+                    failed += 1
+                    logger.warning(f"[BATCH {batch_id}] Не вдалось відправити повідомлення {local_num} (Seq: {seq_num})")
+                
+                # МОДИФІКОВАНО: Збільшена затримка з 0.15 до 0.3 секунди
+                time.sleep(0.3)
+                
             except Exception as e:
-                logger.exception(f"[BATCH {batch_id}] Error sending message: {e}")
-                send_message(chat_id, ERROR_SEND_FAILED.format(error=str(e)), parse_mode="HTML")
-                break
+                failed += 1
+                logger.exception(f"[BATCH {batch_id}] Error sending message {i + 1}: {e}")
+                time.sleep(0.3)
 
         # Додаємо запис до історії
-        status = "completed" if sent == count else "partial"
+        status = "completed" if sent == count else "partial" if sent > 0 else "failed"
         add_to_history(batch_id, count, sent, status)
         
         text_done = DONE_TEXT.format(
@@ -418,8 +469,13 @@ def handle_plus_command(chat_id, user_id, text):
             total=message_count,
             sequence=global_sequence
         )
+        
+        # Додаємо інформацію про невдачі
+        if failed > 0:
+            text_done += f"\n<b>⚠️ Помилок:</b> {failed}"
+        
         send_message(chat_id, text_done, parse_mode="HTML")        
-        logger.info(f"[BATCH {batch_id}] Завершено: {sent}/{count} повідомлень, послідовність: {sequence_start}-{global_sequence}")
+        logger.info(f"[BATCH {batch_id}] Завершено: {sent}/{count} успішно, {failed} помилок, послідовність: {sequence_start}-{global_sequence}")
 
     except Exception as e:
         logger.error(f"[THREAD ERROR] {e}", exc_info=True)
