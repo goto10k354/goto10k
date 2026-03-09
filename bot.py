@@ -26,6 +26,10 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 PORT = int(os.getenv("PORT", "5000"))
 
+# МОДИФІКОВАНО: Регульовані задержки
+MESSAGE_DELAY = float(os.getenv("MESSAGE_DELAY", "0.5"))
+MAX_RETRIES_PER_MESSAGE = int(os.getenv("MAX_RETRIES_PER_MESSAGE", "3"))
+
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -64,6 +68,9 @@ SEQUENCE_FILE = Path("message_sequence.json")
 HISTORY_FILE = Path("message_history.json")
 lock = threading.Lock()
 
+# МОДИФІКОВАНО: Відслідження відправлених послідовностей
+sent_sequences_file = Path("sent_sequences.json")
+
 def load_count():
     """Завантаження загального лічильника"""
     try:
@@ -74,12 +81,14 @@ def load_count():
         logger.exception(f"Failed to load count: {e}")
     return 0
 
+
 def save_count(value):
     """Збереження загального лічильника"""
     try:
         PERSIST_FILE.write_text(json.dumps({"count": int(value)}), encoding="utf-8")
     except Exception as e:
         logger.exception(f"Failed to save count: {e}")
+
 
 def load_sequence():
     """Завантаження глобального лічильника послідовності"""
@@ -91,12 +100,14 @@ def load_sequence():
         logger.exception(f"Failed to load sequence: {e}")
     return 0
 
+
 def save_sequence(value):
     """Збереження глобального лічильника послідовності"""
     try:
         SEQUENCE_FILE.write_text(json.dumps({"sequence": int(value)}), encoding="utf-8")
     except Exception as e:
         logger.exception(f"Failed to save sequence: {e}")
+
 
 def load_history():
     """Завантаження історії повідомлень"""
@@ -108,6 +119,7 @@ def load_history():
         logger.exception(f"Failed to load history: {e}")
     return []
 
+
 def save_history(history):
     """Збереження історії повідомлень"""
     try:
@@ -115,12 +127,33 @@ def save_history(history):
     except Exception as e:
         logger.exception(f"Failed to save history: {e}")
 
+
+def load_sent_sequences():
+    """МОДИФІКОВАНО: Завантаження відправлених послідовностей для дедупліціції"""
+    try:
+        if sent_sequences_file.exists():
+            data = json.loads(sent_sequences_file.read_text(encoding="utf-8"))
+            return set(data.get("sequences", []))
+    except Exception as e:
+        logger.exception(f"Failed to load sent sequences: {e}")
+    return set()
+
+
+def save_sent_sequences(sequences):
+    """МОДИФІКОВАНО: Збереження відправлених послідовностей"""
+    try:
+        sent_sequences_file.write_text(json.dumps({"sequences": list(sequences)}, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.exception(f"Failed to save sent sequences: {e}")
+
 # ======= Ініціалізація глобальних змінних =======
 message_count = load_count()
 global_sequence = load_sequence()
 message_history = load_history()
+sent_sequences = load_sent_sequences()
 sending_in_progress = False
 sending_lock = threading.Lock()
+last_sent_sequence = max(sent_sequences) if sent_sequences else 0
 
 def increment_count():
     """Збільшення лічильника повідомлень"""
@@ -138,6 +171,18 @@ def get_next_sequence():
         global_sequence += 1
         save_sequence(global_sequence)
         return global_sequence
+
+
+def rollback_sequence():
+    """МОДИФІКОВАНО: Откат послідовності при помилці"""
+    global global_sequence
+    with lock:
+        if global_sequence > 0:
+            global_sequence -= 1
+            save_sequence(global_sequence)
+            logger.warning(f"[ROLLBACK] Послідовність откачена до {global_sequence}")
+            return True
+    return False
 
 
 def add_to_history(batch_id, total_count, sent_count, status, timestamp=None):
@@ -164,6 +209,7 @@ def add_to_history(batch_id, total_count, sent_count, status, timestamp=None):
     logger.info(f"[HISTORY] Batch {batch_id}: {sent_count}/{total_count} ({status})")
     return record
 
+
 def get_history_stats():
     """Отримання статистики з історії"""
     with lock:
@@ -178,7 +224,7 @@ def get_history_stats():
 # ======= Текстові константи =======
 WELCOME_TEXT = (
     "<b>👋 Привіт!</b>\n\n"
-    "Я допоможу вам надіслати повідомлення в канал.\n\n"
+    "Я допомогу вам надіслати повідомлення в канал.\n\n"
     "<b>📊 Всього надіслано:</b> {count}\n"
     "<b>🔢 Глобальна послідовність:</b> {sequence}\n"
     "<b>📦 Успішних партій:</b> {batches}"
@@ -270,8 +316,11 @@ def stop_idle_mode():
 # ======= Telegram API функції =======
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-def send_message_safe(chat_id, text, parse_mode=None, reply_markup=None, max_retries=3):
-    """МОДИФІКОВАНО: Безпечна відправка з повторними спробами"""
+def send_message_safe(chat_id, text, parse_mode=None, reply_markup=None, max_retries=None):
+    """МОДИФІКОВАНО: Безпечна відправка з повторними спробами та перевіркою"""
+    if max_retries is None:
+        max_retries = MAX_RETRIES_PER_MESSAGE
+    
     url = f"{API_BASE}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
     if parse_mode:
@@ -281,36 +330,40 @@ def send_message_safe(chat_id, text, parse_mode=None, reply_markup=None, max_ret
     
     for attempt in range(max_retries):
         try:
-            resp = requests.post(url, json=payload, timeout=10)
+            resp = requests.post(url, json=payload, timeout=15)
             resp.raise_for_status()
             result = resp.json()
             
             if result.get("ok"):
-                logger.info(f"[SEND] Успішно відправлено до {chat_id} (спроба {attempt + 1})")
+                logger.info(f"[SEND_OK] Повідомлення до {chat_id} успішно (спроба {attempt + 1}/{max_retries})")
                 return result
             else:
                 error_msg = result.get("description", "Unknown error")
-                logger.warning(f"[SEND] Telegram API помилка: {error_msg}")
+                logger.warning(f"[SEND_FAIL] Telegram API помилка: {error_msg} (спроба {attempt + 1}/{max_retries})")
                 if attempt < max_retries - 1:
-                    time.sleep(0.5 * (attempt + 1))
+                    wait_time = 1.0 * (attempt + 1)
+                    logger.info(f"[SEND_WAIT] Очікування {wait_time}s перед повторною спробою...")
+                    time.sleep(wait_time)
                 continue
         except requests.exceptions.Timeout:
-            logger.warning(f"[SEND] Timeout при спробі {attempt + 1}/{max_retries}")
+            logger.warning(f"[SEND_TIMEOUT] Timeout при спробі {attempt + 1}/{max_retries}")
             if attempt < max_retries - 1:
-                time.sleep(1 * (attempt + 1))
+                wait_time = 1.5 * (attempt + 1)
+                time.sleep(wait_time)
             continue
         except requests.exceptions.ConnectionError as e:
-            logger.warning(f"[SEND] Помилка з'єднання при спробі {attempt + 1}/{max_retries}: {e}")
+            logger.warning(f"[SEND_CONN_ERR] Помилка з'єднання при спробі {attempt + 1}/{max_retries}: {e}")
             if attempt < max_retries - 1:
-                time.sleep(1 * (attempt + 1))
+                wait_time = 1.5 * (attempt + 1)
+                time.sleep(wait_time)
             continue
         except Exception as e:
-            logger.error(f"[SEND] Непередбачена помилка при спробі {attempt + 1}/{max_retries}: {e}")
+            logger.error(f"[SEND_ERR] Непередбачена помилка при спробі {attempt + 1}/{max_retries}: {e}")
             if attempt < max_retries - 1:
-                time.sleep(0.5 * (attempt + 1))
+                time.sleep(1.0 * (attempt + 1))
             continue
     
-    logger.error(f"[SEND] Не вдалось відправити повідомлення до {chat_id} після {max_retries} спроб")
+    logger.error(f"[SEND_FAILED] Не вдалось відправити повідомлення до {chat_id} після {max_retries} спроб")
     return None
 
 
@@ -384,7 +437,7 @@ def handle_command(command, chat_id, user_id):
 
 
 def handle_plus_command(chat_id, user_id, text):
-    global sending_in_progress, message_count, global_sequence    
+    global sending_in_progress, message_count, global_sequence, last_sent_sequence, sent_sequences
     try:
         logger.info(f"[THREAD] +число команда від {user_id}")
 
@@ -422,42 +475,68 @@ def handle_plus_command(chat_id, user_id, text):
         # Відправка сповіщення про початок
         text_sending = SENDING_TEXT.format(count=count, batch_id=batch_id)
         send_message(chat_id, text_sending, parse_mode="HTML")        
-        logger.info(f"[BATCH {batch_id}] Початок відправлення {count} повідомлень")
+        logger.info(f"[BATCH {batch_id}] Початок відправлення {count} повідомлень (Delay: {MESSAGE_DELAY}s)")
 
         sent = 0
         failed = 0
+        duplicates = 0
+        gaps = []
         sequence_start = global_sequence
+        batch_sent_sequences = []
         
         for i in range(count):
             try:
-                # МОДИФІКОВАНО: Отримуємо послідовність перед відправкою
+                # МОДИФІКОВАНО: Получаем последовательность перед отправкой
                 seq_num = get_next_sequence()
                 local_num = i + 1
+                
+                # МОДИФІКОВАНО: Проверка на дубль
+                if seq_num in sent_sequences:
+                    logger.warning(f"[BATCH {batch_id}] ⚠️ ДУБЛЬ ОБНАРУЖЕН: Seq {seq_num} уже был отправлен ранее")
+                    rollback_sequence()
+                    duplicates += 1
+                    failed += 1
+                    time.sleep(MESSAGE_DELAY)
+                    continue
+                
+                # МОДИФІКОВАНО: Проверка пропусків
+                if seq_num > last_sent_sequence + 1:
+                    gap = seq_num - last_sent_sequence - 1
+                    logger.warning(f"[BATCH {batch_id}] ⚠️ GAP DETECTED: пропущено {gap} номеров ({last_sent_sequence + 1}-{seq_num - 1})")
+                    gaps.append((last_sent_sequence + 1, seq_num - 1))
                 
                 # МОДИФІКОВАНО: Комбінований номер (локальний + глобальний)
                 msg_text = f"+{local_num} (Seq: {seq_num})"
                 
                 # МОДИФІКОВАНО: Відправляємо з перевіркою успішності
-                result = send_message_safe(CHANNEL_ID, msg_text, max_retries=3)
+                result = send_message_safe(CHANNEL_ID, msg_text, max_retries=MAX_RETRIES_PER_MESSAGE)
                 
                 if result and result.get("ok"):
                     # МОДИФІКОВАНО: Тільки збільшуємо счетчик при успішній відправці
                     increment_count()
                     sent += 1
-                    logger.info(f"[BATCH {batch_id}] Повідомлення {local_num}/{count} успішно (Seq: {seq_num})")
+                    last_sent_sequence = seq_num
+                    batch_sent_sequences.append(seq_num)
+                    sent_sequences.add(seq_num)
+                    logger.info(f"[BATCH {batch_id}] ✅ Повідомлення {local_num}/{count} успішно (Seq: {seq_num})")
                 else:
                     # Якщо не вдалось, пропускаємо і рахуємо як невдачу
                     failed += 1
-                    logger.warning(f"[BATCH {batch_id}] Не вдалось відправити повідомлення {local_num} (Seq: {seq_num})")
+                    logger.warning(f"[BATCH {batch_id}] ❌ Не вдалось відправити повідомлення {local_num} (Seq: {seq_num})")
+                    rollback_sequence()
                 
-                # МОДИФІКОВАНО: Збільшена затримка з 0.15 до 0.3 секунди
-                time.sleep(0.3)
+                # МОДИФІКОВАНО: Регульована задержка
+                time.sleep(MESSAGE_DELAY)
                 
             except Exception as e:
                 failed += 1
-                logger.exception(f"[BATCH {batch_id}] Error sending message {i + 1}: {e}")
-                time.sleep(0.3)
+                logger.exception(f"[BATCH {batch_id}] ❌ Error sending message {i + 1}: {e}")
+                rollback_sequence()
+                time.sleep(MESSAGE_DELAY)
 
+        # Зберігаємо оновлену список відправлених послідовностей
+        save_sent_sequences(sent_sequences)
+        
         # Додаємо запис до історії
         status = "completed" if sent == count else "partial" if sent > 0 else "failed"
         add_to_history(batch_id, count, sent, status)
@@ -470,12 +549,16 @@ def handle_plus_command(chat_id, user_id, text):
             sequence=global_sequence
         )
         
-        # Додаємо інформацію про невдачі
+        # Додаємо інформацію про результати
         if failed > 0:
             text_done += f"\n<b>⚠️ Помилок:</b> {failed}"
+        if duplicates > 0:
+            text_done += f"\n<b>🔁 Дублів:</b> {duplicates}"
+        if gaps:
+            text_done += f"\n<b>⛔ Розривів послідовності:</b> {len(gaps)}"
         
         send_message(chat_id, text_done, parse_mode="HTML")        
-        logger.info(f"[BATCH {batch_id}] Завершено: {sent}/{count} успішно, {failed} помилок, послідовність: {sequence_start}-{global_sequence}")
+        logger.info(f"[BATCH {batch_id}] ✅ Завершено: {sent}/{count} успішно, {failed} помилок, {duplicates} дублів, послідовність: {sequence_start}-{global_sequence}")
 
     except Exception as e:
         logger.error(f"[THREAD ERROR] {e}", exc_info=True)
@@ -550,6 +633,9 @@ def index():
         "total_messages": message_count,
         "global_sequence": global_sequence,
         "successful_batches": hist_stats["successful_batches"],
+        "last_sent_sequence": last_sent_sequence,
+        "sent_sequences_count": len(sent_sequences),
+        "message_delay": MESSAGE_DELAY,
         "timestamp": datetime.now().isoformat()
     }
     return jsonify(stats), 200
@@ -565,6 +651,9 @@ def api_stats():
         "total_batches": hist_stats["total_batches"],
         "total_from_history": hist_stats["total_from_history"],
         "is_sending": sending_in_progress,
+        "last_sent_sequence": last_sent_sequence,
+        "sent_sequences_count": len(sent_sequences),
+        "message_delay": MESSAGE_DELAY,
         "timestamp": datetime.now().isoformat()
     }), 200
 
@@ -581,6 +670,9 @@ if __name__ == "__main__":
         logger.info(f"Загальний лічильник: {message_count}")
         logger.info(f"Глобальна послідовність: {global_sequence}")
         logger.info(f"Записів у історії: {len(message_history)}")
+        logger.info(f"Задержка між повідомленнями: {MESSAGE_DELAY}s")
+        logger.info(f"Макс спроб на повідомлення: {MAX_RETRIES_PER_MESSAGE}")
+        logger.info(f"Відправлених послідовностей: {len(sent_sequences)}")
         logger.info("=" * 60)
         
         # Удаляем старый webhook перед регистрацией нового
