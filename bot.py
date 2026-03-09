@@ -58,11 +58,14 @@ idle_max_interval = 600
 idle_thread = None
 idle_stop_event = threading.Event()
 
-# ======= Персистентний лічильник =======
+# ======= Персистентній лічильник та послідовність (МОДЕРНІЗОВАНО) =======
 PERSIST_FILE = Path("message_count.json")
+SEQUENCE_FILE = Path("message_sequence.json")
+HISTORY_FILE = Path("message_history.json")
 lock = threading.Lock()
 
 def load_count():
+    """Завантаження загального лічильника"""
     try:
         if PERSIST_FILE.exists():
             data = json.loads(PERSIST_FILE.read_text(encoding="utf-8"))
@@ -72,45 +75,146 @@ def load_count():
     return 0
 
 def save_count(value):
+    """Збереження загального лічильника"""
     try:
         PERSIST_FILE.write_text(json.dumps({"count": int(value)}), encoding="utf-8")
     except Exception as e:
         logger.exception(f"Failed to save count: {e}")
 
+def load_sequence():
+    """Завантаження глобального лічильника послідовності"""
+    try:
+        if SEQUENCE_FILE.exists():
+            data = json.loads(SEQUENCE_FILE.read_text(encoding="utf-8"))
+            return int(data.get("sequence", 0))
+    except Exception as e:
+        logger.exception(f"Failed to load sequence: {e}")
+    return 0
+
+def save_sequence(value):
+    """Збереження глобального лічильника послідовності"""
+    try:
+        SEQUENCE_FILE.write_text(json.dumps({"sequence": int(value)}), encoding="utf-8")
+    except Exception as e:
+        logger.exception(f"Failed to save sequence: {e}")
+
+def load_history():
+    """Завантаження історії повідомлень"""
+    try:
+        if HISTORY_FILE.exists():
+            data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+            return data.get("history", [])
+    except Exception as e:
+        logger.exception(f"Failed to load history: {e}")
+    return []
+
+def save_history(history):
+    """Збереження історії повідомлень"""
+    try:
+        HISTORY_FILE.write_text(json.dumps({"history": history}, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.exception(f"Failed to save history: {e}")
+
+# ======= Ініціалізація глобальних змінних =======
 message_count = load_count()
+global_sequence = load_sequence()
+message_history = load_history()
+sending_in_progress = False
+sending_lock = threading.Lock()
 
 def increment_count():
+    """Збільшення лічильника повідомлень"""
     global message_count
     with lock:
         message_count += 1
         save_count(message_count)
         return message_count
 
+
+def get_next_sequence():
+    """Отримання наступного номеру послідовності (КРИТИЧНО ДЛЯ ФІКСУ)"""
+    global global_sequence
+    with lock:
+        global_sequence += 1
+        save_sequence(global_sequence)
+        return global_sequence
+
+
+def add_to_history(batch_id, total_count, sent_count, status, timestamp=None):
+    """Додавання запису до історії"""
+    global message_history
+    if timestamp is None:
+        timestamp = datetime.now().isoformat()
+    
+    record = {
+        "batch_id": batch_id,
+        "total_requested": total_count,
+        "total_sent": sent_count,
+        "status": status,
+        "timestamp": timestamp
+    }
+    
+    with lock:
+        message_history.append(record)
+        # Зберігаємо тільки останні 1000 записів
+        if len(message_history) > 1000:
+            message_history = message_history[-1000:]
+        save_history(message_history)
+    
+    logger.info(f"[HISTORY] Batch {batch_id}: {sent_count}/{total_count} ({status})")
+    return record
+
+def get_history_stats():
+    """Отримання статистики з історії"""
+    with lock:
+        successful_batches = len([h for h in message_history if h["status"] == "completed"])
+        total_from_history = sum([h["total_sent"] for h in message_history])
+        return {
+            "successful_batches": successful_batches,
+            "total_from_history": total_from_history,
+            "total_batches": len(message_history)
+        }
+
 # ======= Текстові константи =======
 WELCOME_TEXT = (
     "<b>👋 Привіт!</b>\n\n"
     "Я допоможу вам надіслати повідомлення в канал.\n\n"
-    "<b>📊 Всього надіслано:</b> {count}"
+    "<b>📊 Всього надіслано:</b> {count}\n"
+    "<b>🔢 Глобальна послідовність:</b> {sequence}\n"
+    "<b>📦 Успішних партій:</b> {batches}"
 )
 
 STATS_TEXT = (
     "<b>📊 Статистика</b>\n\n"
-    "<b>Всього повідомлень:</b> {count}"
+    "<b>Всього повідомлень:</b> {count}\n"
+    "<b>Глобальна послідовність:</b> {sequence}\n"
+    "<b>Успішних партій:</b> {batches}\n"
+    "<b>З історії:</b> {history_total}"
 )
 
 SENDING_TEXT = (
-    "<b>⏳ Відправляю {count} повідомлень...</b>"
+    "<b>⏳ Відправляю {count} повідомлень...</b>\n"
+    "<b>Batch ID:</b> {batch_id}"
 )
 
 DONE_TEXT = (
     "<b>✅ Готово</b>\n\n"
+    "<b>Batch ID:</b> {batch_id}\n"
+    "<b>Запрошено:</b> {requested}\n"
     "<b>Надіслано:</b> {sent}\n"
-    "<b>Всього:</b> {total}"
+    "<b>Всього (глобально):</b> {total}\n"
+    "<b>Послідовність:</b> {sequence}"
+)
+
+SENDING_IN_PROGRESS_TEXT = (
+    "⚠️ <b>Відправлення вже в процесі!</b>\n\n"
+    "Зачекайте, поки завершиться попереднє відправлення."
 )
 
 ERROR_FORMAT_TEXT = "❌ Неверний формат. Використовуйте +<число>, наприклад +20"
 ERROR_ADMIN_TEXT = "❌ Ви не адміністратор"
 ERROR_RATE_LIMIT = "❌ Забагато запитів. Спробуйте пізніше"
+ERROR_SEND_FAILED = "❌ Помилка при відправленні: {error}"
 
 # ======= Idle mode функції =======
 def simulate_user_activity():
@@ -221,11 +325,22 @@ def handle_command(command, chat_id, user_id):
         logger.info(f"[THREAD] Команда: {command} від {chat_id}")
 
         if command.startswith("/start"):
-            text = WELCOME_TEXT.format(count=message_count)
+            hist_stats = get_history_stats()
+            text = WELCOME_TEXT.format(
+                count=message_count,
+                sequence=global_sequence,
+                batches=hist_stats["successful_batches"]
+            )
             send_message(chat_id, text, parse_mode="HTML")
 
         elif command.startswith("/stats"):
-            text = STATS_TEXT.format(count=message_count)
+            hist_stats = get_history_stats()
+            text = STATS_TEXT.format(
+                count=message_count,
+                sequence=global_sequence,
+                batches=hist_stats["successful_batches"],
+                history_total=hist_stats["total_from_history"]
+            )
             send_message(chat_id, text, parse_mode="HTML")
 
         else:
@@ -236,6 +351,7 @@ def handle_command(command, chat_id, user_id):
 
 
 def handle_plus_command(chat_id, user_id, text):
+    global sending_in_progress, message_count, global_sequence    
     try:
         logger.info(f"[THREAD] +число команда від {user_id}")
 
@@ -244,6 +360,13 @@ def handle_plus_command(chat_id, user_id, text):
             send_message(chat_id, ERROR_ADMIN_TEXT, parse_mode="HTML")
             return
 
+        # Перевірка, чи вже відправляється (КРИТИЧНО ДЛЯ ФІКСУ)
+        with sending_lock:
+            if sending_in_progress:
+                send_message(chat_id, SENDING_IN_PROGRESS_TEXT, parse_mode="HTML")
+                return
+            sending_in_progress = True
+
         # Парсинг числа
         try:
             count = int(text.lstrip("+").strip())
@@ -251,32 +374,58 @@ def handle_plus_command(chat_id, user_id, text):
                 raise ValueError("non-positive")
             if count > 1000:
                 send_message(chat_id, "❌ Максимум 1000 повідомлень за раз", parse_mode="HTML")
+                with sending_lock:
+                    sending_in_progress = False
                 return
         except Exception:
             send_message(chat_id, ERROR_FORMAT_TEXT, parse_mode="HTML")
+            with sending_lock:
+                sending_in_progress = False
             return
 
+        # Генеруємо унікальний ID для цієї партії
+        batch_id = get_next_sequence()
+        
         # Відправка сповіщення про початок
-        text_sending = SENDING_TEXT.format(count=count)
-        send_message(chat_id, text_sending, parse_mode="HTML")
+        text_sending = SENDING_TEXT.format(count=count, batch_id=batch_id)
+        send_message(chat_id, text_sending, parse_mode="HTML")        
+        logger.info(f"[BATCH {batch_id}] Початок відправлення {count} повідомлень")
 
         sent = 0
+        sequence_start = global_sequence        
+        
         for i in range(count):
             try:
-                send_message(CHANNEL_ID, f"+1 ({i+1}/{count})")
+                seq_num = get_next_sequence()
+                # Відправляємо глобальний номер послідовності, а не локальний
+                send_message(CHANNEL_ID, f"+1 (Послідовність: {seq_num})")
                 increment_count()
                 sent += 1
                 time.sleep(0.15)
             except Exception as e:
-                logger.exception(f"Error sending message to channel: {e}")
-                send_message(chat_id, f"Ошибка при отправке: {e}", parse_mode="HTML")
+                logger.exception(f"[BATCH {batch_id}] Error sending message: {e}")
+                send_message(chat_id, ERROR_SEND_FAILED.format(error=str(e)), parse_mode="HTML")
                 break
 
-        text_done = DONE_TEXT.format(sent=sent, total=message_count)
-        send_message(chat_id, text_done, parse_mode="HTML")
+        # Додаємо запис до історії
+        status = "completed" if sent == count else "partial"
+        add_to_history(batch_id, count, sent, status)
+        
+        text_done = DONE_TEXT.format(
+            batch_id=batch_id,
+            requested=count,
+            sent=sent,
+            total=message_count,
+            sequence=global_sequence
+        )
+        send_message(chat_id, text_done, parse_mode="HTML")        
+        logger.info(f"[BATCH {batch_id}] Завершено: {sent}/{count} повідомлень, послідовність: {sequence_start}-{global_sequence}")
 
     except Exception as e:
         logger.error(f"[THREAD ERROR] {e}", exc_info=True)
+    finally:
+        with sending_lock:
+            sending_in_progress = False
 
 # ======= Webhook handler =======
 @app.route("/webhook", methods=["POST"])
@@ -323,12 +472,12 @@ def webhook():
             return "ok", 200
 
         # Обработка +число
-        if text.startswith("+"): 
+        if text.startswith("+"):
             threading.Thread(target=handle_plus_command, args=(chat_id, user_id, text), daemon=True).start()
             return "ok", 200
 
         return "ok", 200
-
+    
     except Exception as e:
         logger.error(f"[WEBHOOK ERROR] {e}", exc_info=True)
         return "error", 500
@@ -339,10 +488,45 @@ def health():
 
 @app.route("/", methods=["GET"])
 def index():
-    return "✅ Бот запущен", 200
+    hist_stats = get_history_stats()
+    stats = {
+        "status": "🟢 Бот запущен",
+        "total_messages": message_count,
+        "global_sequence": global_sequence,
+        "successful_batches": hist_stats["successful_batches"],
+        "timestamp": datetime.now().isoformat()
+    }
+    return jsonify(stats), 200
+
+@app.route("/api/stats", methods=["GET"])
+def api_stats():
+    """API endpoint для отримання детальної статистики"""
+    hist_stats = get_history_stats()
+    return jsonify({
+        "total_count": message_count,
+        "global_sequence": global_sequence,
+        "successful_batches": hist_stats["successful_batches"],
+        "total_batches": hist_stats["total_batches"],
+        "total_from_history": hist_stats["total_from_history"],
+        "is_sending": sending_in_progress,
+        "timestamp": datetime.now().isoformat()
+    }), 200
+
+@app.route("/api/history", methods=["GET"])
+def api_history():
+    """API endpoint для отримання історії повідомлень"""
+    return jsonify({"history": message_history}), 200
 
 if __name__ == "__main__":
     try:
+        logger.info("=" * 60)
+        logger.info("ЗАПУСК ТЕЛЕГРАМ БОТА З МОДЕРНІЗОВАНОЮ СИСТЕМОЮ")
+        logger.info("=" * 60)
+        logger.info(f"Загальний лічильник: {message_count}")
+        logger.info(f"Глобальна послідовність: {global_sequence}")
+        logger.info(f"Записів у історії: {len(message_history)}")
+        logger.info("=" * 60)
+        
         # Удаляем старый webhook перед регистрацией нового
         logger.info("Удаление старого webhook...")
         delete_webhook()
